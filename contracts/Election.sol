@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.27;
-
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-
-enum PoliticalParty { NONE, PDP, APC }
+pragma solidity ^0.8.26;
 
 error OnlyInecChairman();
 error AddressZeroDetected();
@@ -15,15 +11,25 @@ error InvalidPoliticalParty();
 error CitizenNotFound();
 error ElectionNotStarted();
 error ElectionEnded();
+error PartyAlreadyExists();
+error PartyDoesNotExist();
 
-contract Election is ReentrancyGuard {
+contract Election {
     address public inecChairman;
     uint public candidateCount;
     uint256 public citizenCount;
     uint256 public votersCount;
+    uint256 public partyCount;
 
     uint256 public electStart;
     uint256 public electEnds;
+
+    struct PoliticalParty {
+        uint256 id;
+        string name;
+        string abbreviation;
+        bool exists;
+    }
 
     struct CitizenDetails {
         uint256 id;
@@ -33,26 +39,28 @@ contract Election is ReentrancyGuard {
         bool candidate;
         bool citizen;
         bool hasVoted;
-        PoliticalParty politicalParty;
+        uint256 politicalPartyId; // 0 means no party
     }
 
     struct CandidateScore {
         address candidateAddress;
         string name;
-        PoliticalParty party;
+        string partyName;
+        string partyAbbreviation;
         uint256 voteCount;
     }
 
     constructor(uint256 _electStart, uint256 _electEnds) {
         require(_electStart > block.timestamp,"Election start date must be in future" );
-        require(_electEnds > electStart, "Election end date must be greater than start date");
+        require(_electEnds > _electStart, "Election end date must be greater than start date");
 
         electStart = _electStart;
         electEnds = _electEnds;
         inecChairman = msg.sender;
+        partyCount = 0;
     }
 
-    modifier onlyinecChairman() {
+    modifier onlyInecChairman() {
         if (msg.sender != inecChairman) revert OnlyInecChairman();
         _;
     }
@@ -60,11 +68,43 @@ contract Election is ReentrancyGuard {
     mapping(address => CitizenDetails) public citizens;
     mapping(uint256 => CitizenDetails) public candidates;
     mapping(uint256 => uint256) public candidateVotes;
+    mapping(uint256 => PoliticalParty) public politicalParties;
+    mapping(string => bool) public partyAbbreviationExists;
+    mapping(string => bool) public partyNameExists;
     
     event CandidateRegistered(address indexed _inecChairman, address indexed _addr);
     event CitizenRegistered(address indexed _citizenAddr, string _name);
     event VoterRegistered(address indexed _voterAddr, string _name);
     event VoteCast(address indexed _voter, uint256 indexed _candidateId);
+    event PoliticalPartyRegistered(uint256 indexed _partyId, string _name, string _abbreviation);
+
+    function registerPoliticalParty(string memory _name, string memory _abbreviation) external onlyInecChairman {
+        if (bytes(_name).length == 0 || bytes(_abbreviation).length == 0) revert InvalidPoliticalParty();
+        if (partyNameExists[_name]) revert PartyAlreadyExists();
+        if (partyAbbreviationExists[_abbreviation]) revert PartyAlreadyExists();
+        
+        uint256 partyId = partyCount + 1;
+        
+        PoliticalParty storage newParty = politicalParties[partyId];
+        newParty.id = partyId;
+        newParty.name = _name;
+        newParty.abbreviation = _abbreviation;
+        newParty.exists = true;
+        
+        partyNameExists[_name] = true;
+        partyAbbreviationExists[_abbreviation] = true;
+        partyCount = partyId;
+        
+        emit PoliticalPartyRegistered(partyId, _name, _abbreviation);
+    }
+
+    function getPartyDetails(uint256 _partyId) external view returns (string memory name, string memory abbreviation) {
+        if (_partyId == 0 || _partyId > partyCount) revert InvalidPoliticalParty();
+        if (!politicalParties[_partyId].exists) revert PartyDoesNotExist();
+        
+        PoliticalParty storage party = politicalParties[_partyId];
+        return (party.name, party.abbreviation);
+    }
 
     function registerAsCitizen(string memory _fullName) external {
         if (msg.sender == address(0)) revert AddressZeroDetected();
@@ -76,19 +116,21 @@ contract Election is ReentrancyGuard {
         citizenDetails.name = _fullName;
         citizenDetails.addr = msg.sender;
         citizenDetails.citizen = true;
+        citizenDetails.politicalPartyId = 0; // No party by default
         citizenCount += 1;
 
         emit CitizenRegistered(msg.sender, _fullName);
     }
 
     function registerCandidate(
-        PoliticalParty _politicalParty,
+        uint256 _politicalPartyId,
         address _candidateAddr
-    ) external onlyinecChairman {
+    ) external onlyInecChairman {
         // Sanity checks
         if (_candidateAddr == address(0)) revert AddressZeroDetected();
         require(candidateCount < 2, "inecChairman is only taking two candidates");
-        if (_politicalParty == PoliticalParty.NONE) revert InvalidPoliticalParty();
+        if (_politicalPartyId == 0 || _politicalPartyId > partyCount) revert InvalidPoliticalParty();
+        if (!politicalParties[_politicalPartyId].exists) revert PartyDoesNotExist();
 
         CitizenDetails storage citizenCheck = citizens[_candidateAddr];
         if (!citizenCheck.citizen) revert NotRegisteredAsCitizen();
@@ -99,13 +141,13 @@ contract Election is ReentrancyGuard {
         CitizenDetails storage citizenDetails = candidates[candidateId];
         citizenDetails.addr = _candidateAddr;
         citizenDetails.name = citizenCheck.name;
-        citizenDetails.politicalParty = _politicalParty;
+        citizenDetails.politicalPartyId = _politicalPartyId;
         citizenDetails.candidate = true;
         citizenDetails.voter = true;
         
         // Update the citizen's record
         citizenCheck.candidate = true;
-        citizenCheck.politicalParty = _politicalParty;
+        citizenCheck.politicalPartyId = _politicalPartyId;
         
         candidateCount = candidateId;
 
@@ -152,7 +194,9 @@ contract Election is ReentrancyGuard {
             bool isCandidate,
             bool isCitizen,
             bool hasVoted,
-            PoliticalParty party
+            uint256 politicalPartyId,
+            string memory partyName,
+            string memory partyAbbreviation
         ) 
     {
         if (_citizenAddr == address(0)) revert AddressZeroDetected();
@@ -160,17 +204,27 @@ contract Election is ReentrancyGuard {
         CitizenDetails storage citizen = citizens[_citizenAddr];
         if (!citizen.citizen) revert CitizenNotFound();
 
+        string memory _partyName = "";
+        string memory _partyAbbreviation = "";
+        
+        if (citizen.politicalPartyId > 0 && politicalParties[citizen.politicalPartyId].exists) {
+            _partyName = politicalParties[citizen.politicalPartyId].name;
+            _partyAbbreviation = politicalParties[citizen.politicalPartyId].abbreviation;
+        }
+
         return (
             citizen.name,
             citizen.voter,
             citizen.candidate,
             citizen.citizen,
             citizen.hasVoted,
-            citizen.politicalParty
+            citizen.politicalPartyId,
+            _partyName,
+            _partyAbbreviation
         );
     }
 
-     function getVotingScores() 
+    function getVotingScores() 
         external 
         view 
         returns (CandidateScore[] memory) 
@@ -179,10 +233,19 @@ contract Election is ReentrancyGuard {
         
         for (uint256 i = 1; i <= candidateCount; i++) {
             CitizenDetails storage candidate = candidates[i];
+            string memory partyName = "";
+            string memory partyAbbreviation = "";
+            
+            if (candidate.politicalPartyId > 0 && politicalParties[candidate.politicalPartyId].exists) {
+                partyName = politicalParties[candidate.politicalPartyId].name;
+                partyAbbreviation = politicalParties[candidate.politicalPartyId].abbreviation;
+            }
+            
             scores[i-1] = CandidateScore({
                 candidateAddress: candidate.addr,
                 name: candidate.name,
-                party: candidate.politicalParty,
+                partyName: partyName,
+                partyAbbreviation: partyAbbreviation,
                 voteCount: candidateVotes[i]
             });
         }
@@ -198,10 +261,19 @@ contract Election is ReentrancyGuard {
         if (_candidateId == 0 || _candidateId > candidateCount) revert InvalidCandidate();
         
         CitizenDetails storage candidate = candidates[_candidateId];
+        string memory partyName = "";
+        string memory partyAbbreviation = "";
+        
+        if (candidate.politicalPartyId > 0 && politicalParties[candidate.politicalPartyId].exists) {
+            partyName = politicalParties[candidate.politicalPartyId].name;
+            partyAbbreviation = politicalParties[candidate.politicalPartyId].abbreviation;
+        }
+        
         return CandidateScore({
             candidateAddress: candidate.addr,
             name: candidate.name,
-            party: candidate.politicalParty,
+            partyName: partyName,
+            partyAbbreviation: partyAbbreviation,
             voteCount: candidateVotes[_candidateId]
         });
     }
@@ -216,5 +288,20 @@ contract Election is ReentrancyGuard {
             totalVotes += candidateVotes[i];
         }
         return totalVotes;
+    }
+
+    // Get all registered political parties
+    function getAllPoliticalParties() 
+        external 
+        view 
+        returns (PoliticalParty[] memory) 
+    {
+        PoliticalParty[] memory parties = new PoliticalParty[](partyCount);
+        
+        for (uint256 i = 1; i <= partyCount; i++) {
+            parties[i-1] = politicalParties[i];
+        }
+        
+        return parties;
     }
 }

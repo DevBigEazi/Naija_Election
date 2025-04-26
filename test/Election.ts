@@ -10,10 +10,28 @@ describe("Election", () => {
     const [inecChairman, citizen1, citizen2, citizen3, citizen4] =
       await hre.ethers.getSigners();
 
+    console.log(inecChairman.address);
+
+      // Current timestamp
+  const currentTimestamp = Math.floor(Date.now() / 1000);
+  
+  // election start time (1 day from now)
+  const electStart = currentTimestamp + (24 * 60 * 60); // 24 hours from now
+  
+  // election end time (3 days from start)
+  const electEnds = electStart + (3 * 24 * 60 * 60); // 3 days after start
+
     const Election = await hre.ethers.getContractFactory("Election");
-    const startTime = (await time.latest()) + 60; // Start in 1 minute
-    const endTime = startTime + 86400; // End in 24 hours
-    const deployElection = await Election.deploy(startTime, endTime);
+
+    const deployElection = await Election.deploy(electStart, electEnds);
+
+    // Register political parties by default for testing
+    await deployElection
+      .connect(inecChairman)
+      .registerPoliticalParty("People's Democratic Party", "PDP");
+    await deployElection
+      .connect(inecChairman)
+      .registerPoliticalParty("All Progressive Congress", "APC");
 
     return {
       deployElection,
@@ -22,8 +40,8 @@ describe("Election", () => {
       citizen2,
       citizen3,
       citizen4,
-      startTime,
-      endTime,
+      electStart,
+      electEnds,
     };
   };
 
@@ -39,16 +57,70 @@ describe("Election", () => {
     });
 
     it("Should set the correct election time period", async () => {
-      const { deployElection, startTime, endTime } = await loadFixture(
+      const { deployElection, electStart, electEnds } = await loadFixture(
         deployElectionContract
       );
 
       expect(await time.latest())
-        .to.be.lessThan(startTime)
+        .to.be.lessThan(electStart)
         .to.be.revertedWith("Election start date must be in future");
-      expect(startTime)
-        .to.be.lessThan(endTime)
+      expect(electStart)
+        .to.be.lessThan(electEnds)
         .to.be.revertedWith("Election end date must be greater");
+    });
+  });
+
+  describe("Political Party Registration", () => {
+    it("Should register new political parties", async () => {
+      const { deployElection, inecChairman } = await loadFixture(
+        deployElectionContract
+      );
+
+      // Register a new party
+      await expect(
+        deployElection
+          .connect(inecChairman)
+          .registerPoliticalParty("New Nigeria People's Party", "NNPP")
+      )
+        .to.emit(deployElection, "PoliticalPartyRegistered")
+        .withArgs(3, "New Nigeria People's Party", "NNPP");
+
+      // Check if party was registered
+      const partyDetails = await deployElection.getPartyDetails(3);
+      expect(partyDetails.name).to.equal("New Nigeria People's Party");
+      expect(partyDetails.abbreviation).to.equal("NNPP");
+    });
+
+    it("Should not allow non-chairman to register parties", async () => {
+      const { deployElection, citizen1 } = await loadFixture(
+        deployElectionContract
+      );
+
+      await expect(
+        deployElection
+          .connect(citizen1)
+          .registerPoliticalParty("Labour Party", "LP")
+      ).to.be.revertedWithCustomError(deployElection, "OnlyInecChairman");
+    });
+
+    it("Should not register a party with existing name or abbreviation", async () => {
+      const { deployElection, inecChairman } = await loadFixture(
+        deployElectionContract
+      );
+
+      // Try to register with existing abbreviation
+      await expect(
+        deployElection
+          .connect(inecChairman)
+          .registerPoliticalParty("New Party", "PDP")
+      ).to.be.revertedWithCustomError(deployElection, "PartyAlreadyExists");
+
+      // Try to register with existing name
+      await expect(
+        deployElection
+          .connect(inecChairman)
+          .registerPoliticalParty("People's Democratic Party", "XYZ")
+      ).to.be.revertedWithCustomError(deployElection, "PartyAlreadyExists");
     });
   });
 
@@ -69,6 +141,7 @@ describe("Election", () => {
       );
       expect(citizenDetails.name).to.equal("John Doe");
       expect(citizenDetails.isCitizen).to.be.true;
+      expect(citizenDetails.politicalPartyId).to.equal(0); // No party by default
     });
 
     it("Should not register same citizen twice", async () => {
@@ -103,7 +176,9 @@ describe("Election", () => {
         citizen1.address
       );
       expect(candidateDetails.isCandidate).to.be.true;
-      expect(candidateDetails.party).to.equal(1); // PDP
+      expect(candidateDetails.politicalPartyId).to.equal(1); // PDP party ID
+      expect(candidateDetails.partyName).to.equal("People's Democratic Party");
+      expect(candidateDetails.partyAbbreviation).to.equal("PDP");
     });
 
     it("Should only allow INEC chairman to register candidates", async () => {
@@ -128,6 +203,20 @@ describe("Election", () => {
           .connect(inecChairman)
           .registerCandidate(1, citizen1.address)
       ).to.be.revertedWithCustomError(deployElection, "NotRegisteredAsCitizen");
+    });
+
+    it("Should not register a candidate with invalid party ID", async () => {
+      const { deployElection, inecChairman, citizen1 } = await loadFixture(
+        deployElectionContract
+      );
+
+      await deployElection.connect(citizen1).registerAsCitizen("John Doe");
+
+      await expect(
+        deployElection
+          .connect(inecChairman)
+          .registerCandidate(999, citizen1.address) // Invalid party ID
+      ).to.be.revertedWithCustomError(deployElection, "InvalidPoliticalParty");
     });
   });
 
@@ -162,7 +251,7 @@ describe("Election", () => {
 
   describe("Voting Process", () => {
     it("Should allow voting during election period", async () => {
-      const { deployElection, inecChairman, citizen1, citizen2, startTime } =
+      const { deployElection, inecChairman, citizen1, citizen2, electStart } =
         await loadFixture(deployElectionContract);
 
       // Register citizens
@@ -182,7 +271,7 @@ describe("Election", () => {
       await deployElection.connect(citizen2).registerAsVoter();
 
       // Move time to election period
-      await time.increaseTo(startTime + 1);
+      await time.increaseTo(electStart + 1);
 
       // Vote
       await expect(deployElection.connect(citizen1).voteFavoriteCandidate(2))
@@ -194,16 +283,17 @@ describe("Election", () => {
     });
 
     it("Should not allow voting before election starts", async () => {
-      const { deployElection, citizen1, citizen2 } = await loadFixture(
-        deployElectionContract
-      );
+      const { deployElection, inecChairman, citizen1, citizen2 } =
+        await loadFixture(deployElectionContract);
 
       // Setup
       await deployElection.connect(citizen1).registerAsCitizen("John Doe");
-      await deployElection.connect(citizen2).registerAsCitizen("John Egbeda");
+      await deployElection.connect(citizen2).registerAsCitizen("Jane Smith");
       await deployElection.connect(citizen1).registerAsVoter();
 
-      await deployElection.registerCandidate(1, citizen2);
+      await deployElection
+        .connect(inecChairman)
+        .registerCandidate(1, citizen2.address);
 
       // Try voting before start time
       await expect(
@@ -212,19 +302,20 @@ describe("Election", () => {
     });
 
     it("Should not allow voting after election ends", async () => {
-      const { deployElection, citizen1, citizen2, endTime } = await loadFixture(
-        deployElectionContract
-      );
+      const { deployElection, inecChairman, citizen1, citizen2, electEnds } =
+        await loadFixture(deployElectionContract);
 
       // Setup
       await deployElection.connect(citizen1).registerAsCitizen("John Doe");
-      await deployElection.connect(citizen2).registerAsCitizen("John Egbeda");
+      await deployElection.connect(citizen2).registerAsCitizen("Jane Smith");
       await deployElection.connect(citizen1).registerAsVoter();
 
-      await deployElection.registerCandidate(1, citizen2);
+      await deployElection
+        .connect(inecChairman)
+        .registerCandidate(1, citizen2.address);
 
       // Move time past end time
-      await time.increaseTo(endTime + 1);
+      await time.increaseTo(electEnds + 1);
 
       // Try voting after end time
       await expect(
@@ -235,7 +326,7 @@ describe("Election", () => {
 
   describe("Election Results", () => {
     it("Should correctly track voting scores", async () => {
-      const { deployElection, inecChairman, citizen1, citizen2, startTime } =
+      const { deployElection, inecChairman, citizen1, citizen2, electStart } =
         await loadFixture(deployElectionContract);
 
       // Setup election
@@ -252,7 +343,7 @@ describe("Election", () => {
       await deployElection.connect(citizen1).registerAsVoter();
       await deployElection.connect(citizen2).registerAsVoter();
 
-      await time.increaseTo(startTime + 1);
+      await time.increaseTo(electStart + 1);
 
       // Cast votes
       await deployElection.connect(citizen1).voteFavoriteCandidate(2);
@@ -265,6 +356,62 @@ describe("Election", () => {
 
       const totalVotes = await deployElection.getTotalVotesCast();
       expect(totalVotes).to.equal(2);
+    });
+
+    it("Should display correct party information in results", async () => {
+      const { deployElection, inecChairman, citizen1, citizen2, electStart } =
+        await loadFixture(deployElectionContract);
+
+      // Setup election
+      await deployElection.connect(citizen1).registerAsCitizen("John Doe");
+      await deployElection.connect(citizen2).registerAsCitizen("Jane Smith");
+
+      await deployElection
+        .connect(inecChairman)
+        .registerCandidate(1, citizen1.address); // PDP
+      await deployElection
+        .connect(inecChairman)
+        .registerCandidate(2, citizen2.address); // APC
+
+      await deployElection.connect(citizen1).registerAsVoter();
+      await deployElection.connect(citizen2).registerAsVoter();
+
+      await time.increaseTo(electStart + 1);
+
+      // Cast votes
+      await deployElection.connect(citizen1).voteFavoriteCandidate(2);
+      await deployElection.connect(citizen2).voteFavoriteCandidate(1);
+
+      // Check results
+      const scores = await deployElection.getVotingScores();
+      expect(scores[0].partyName).to.equal("People's Democratic Party");
+      expect(scores[0].partyAbbreviation).to.equal("PDP");
+      expect(scores[1].partyName).to.equal("All Progressive Congress");
+      expect(scores[1].partyAbbreviation).to.equal("APC");
+    });
+  });
+
+  describe("Political Party Listing", () => {
+    it("Should list all registered political parties", async () => {
+      const { deployElection, inecChairman } = await loadFixture(
+        deployElectionContract
+      );
+
+      // Register another party
+      await deployElection
+        .connect(inecChairman)
+        .registerPoliticalParty("Labour Party", "LP");
+
+      // Get all parties
+      const parties = await deployElection.getAllPoliticalParties();
+
+      expect(parties.length).to.equal(3);
+      expect(parties[0].name).to.equal("People's Democratic Party");
+      expect(parties[0].abbreviation).to.equal("PDP");
+      expect(parties[1].name).to.equal("All Progressive Congress");
+      expect(parties[1].abbreviation).to.equal("APC");
+      expect(parties[2].name).to.equal("Labour Party");
+      expect(parties[2].abbreviation).to.equal("LP");
     });
   });
 });
